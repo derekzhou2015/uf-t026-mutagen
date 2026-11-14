@@ -540,6 +540,69 @@ class MP4Tags(DictProxy, Tags):
             fileobj.seek(atom.offset + 16)
             fileobj.write(cdata.to_ulonglong_be(o))
 
+    def __update_tfra(self, fileobj, atom, delta, offset):
+        """Update the absolute moof offsets in a 'tfra' atom.
+
+        Fragmented files can end with an 'mfra' box whose 'tfra' entries
+        point at each 'moof' by an absolute file offset. Like the
+        'base_data_offset' in 'tfhd', these have to be shifted when data
+        is inserted or removed earlier in the file.
+        """
+
+        ok, data = atom.read(fileobj)
+        if not ok:
+            raise MP4MetadataError("truncated %r atom" % atom.name)
+
+        version = data[0]
+        if version not in (0, 1):
+            raise MP4MetadataError(
+                "unsupported %r version %d" % (atom.name, version))
+
+        # Payload layout (ISO 14496-12 8.8.14):
+        # version/flags (4) + track_ID (4) + reserved (3) +
+        # length-size byte (1) + number_of_entries (4) = 16 byte header,
+        # followed by the entries.
+        # The length-size byte packs three 2 bit fields for the traf number,
+        # trun number and sample number (high to low); each gives the field
+        # size as (value + 1) bytes. The time and moof offset sizes are fixed
+        # by the version: 4 bytes for version 0, 8 bytes for version 1.
+        lengths = data[11]
+        time_size = 4 if version == 0 else 8
+        moof_size = time_size
+        traf_size = 1 + ((lengths >> 4) & 0x3)
+        trun_size = 1 + ((lengths >> 2) & 0x3)
+        sample_size = 1 + (lengths & 0x3)
+        entry_size = time_size + moof_size + traf_size + trun_size + \
+            sample_size
+
+        header_size = 16
+        entry_count = cdata.uint_be(data[12:16])
+        if len(data) != header_size + entry_count * entry_size:
+            raise MP4MetadataError("wrong entry count inside %r" % atom.name)
+
+        out = bytearray(data[:header_size])
+        pos = header_size
+        for _ in range(entry_count):
+            entry = bytearray(data[pos:pos + entry_size])
+            if moof_size == 4:
+                moof_offset = cdata.uint_be(entry[time_size:time_size + 4])
+                if moof_offset > offset:
+                    moof_offset += delta
+                entry[time_size:time_size + 4] = \
+                    cdata.to_uint_be(moof_offset)
+            else:
+                moof_offset = cdata.ulonglong_be(
+                    entry[time_size:time_size + 8])
+                if moof_offset > offset:
+                    moof_offset += delta
+                entry[time_size:time_size + 8] = \
+                    cdata.to_ulonglong_be(moof_offset)
+            out.extend(entry)
+            pos += entry_size
+
+        fileobj.seek(atom._dataoffset)
+        fileobj.write(bytes(out))
+
     def __update_offsets(self, fileobj, atoms, delta, offset):
         """Update offset tables in all 'stco' and 'co64' atoms."""
         if delta == 0:
@@ -549,11 +612,43 @@ class MP4Tags(DictProxy, Tags):
             self.__update_offset_table(fileobj, ">%dI", atom, delta, offset)
         for atom in moov.findall(b'co64', True):
             self.__update_offset_table(fileobj, ">%dQ", atom, delta, offset)
-        try:
-            for atom in atoms[b"moof"].findall(b'tfhd', True):
+        # A fragmented file has one top-level "moof" atom per fragment, all
+        # of which can carry an absolute "base_data_offset" in their "tfhd"
+        # atom. Updating only the first one (as Atoms.__getitem__ would give
+        # us) leaves every later fragment pointing at data from before the
+        # resize, corrupting the file beyond recovery.
+        for moof in (atom for atom in atoms.atoms if atom.name == b"moof"):
+            for atom in moof.findall(b'tfhd', True):
                 self.__update_tfhd(fileobj, atom, delta, offset)
-        except KeyError:
-            pass
+
+        # An optional trailing "mfra" box indexes the fragments by absolute
+        # moof offsets, which have to be shifted as well. "mfra" is not parsed
+        # as a container by Atom, so walk its payload manually. The atom
+        # objects were parsed before the resize, so an "mfra" located after
+        # the insertion point still carries its old offset; relocate it via
+        # the self-describing trailing "mfro" box.
+        for mfra in (atom for atom in atoms.atoms if atom.name == b"mfra"):
+            fileobj.seek(0, 2)
+            file_size = fileobj.tell()
+            # "mfro" is the last, 16 byte box: size(4) + "mfro"(4) + a
+            # 4 byte payload holding the total "mfra" size. That payload is
+            # the final 4 bytes of the file.
+            fileobj.seek(file_size - 4)
+            mfra_size = cdata.uint_be(fileobj.read(4))
+            mfra_offset = file_size - mfra_size
+            fileobj.seek(mfra_offset + 4)
+            name = fileobj.read(4)
+            if name != b"mfra":
+                raise MP4MetadataError("could not relocate 'mfra' box")
+            end = mfra_offset + mfra_size
+            fileobj.seek(mfra_offset + 8)
+            while fileobj.tell() + 8 <= end:
+                child = Atom(fileobj)
+                if child.name == b"tfra":
+                    self.__update_tfra(fileobj, child, delta, offset)
+                # Atom() leaves the position right after this child; for a
+                # non-container child that is exactly the next box header.
+                fileobj.seek(child.offset + child.length)
 
     def __parse_data(self, atom, data):
         pos = 0

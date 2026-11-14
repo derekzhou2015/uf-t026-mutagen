@@ -918,6 +918,187 @@ class TMP4NoTags3G2(TMP4, TMP4Mixin):
         self.failUnlessAlmostEqual(15, self.audio.info.length, 1)
 
 
+class TMP4Fragmented(TestCase):
+    """A fragmented MP4 contains one top level "moof" atom per fragment, and
+    each "tfhd" may carry an absolute "base_data_offset". Resizing the "moov"
+    atom while writing tags has to shift the references of *every* fragment,
+    not just the first one (see Atoms.__getitem__ returning only the first
+    atom of a given name).
+    """
+
+    original = os.path.join(DATA_DIR, "frag-tags.mp4")
+
+    def setUp(self):
+        self.filename = get_temp_copy(self.original)
+        self.audio = MP4(self.filename)
+
+    def tearDown(self):
+        os.unlink(self.filename)
+
+    def _moofs(self, atoms):
+        return [atom for atom in atoms.atoms if atom.name == b"moof"]
+
+    def _mdat_ranges(self, atoms):
+        return [(atom.offset, atom.offset + atom.length)
+                for atom in atoms.atoms if atom.name == b"mdat"]
+
+    def _base_data_offsets(self, path):
+        with open(path, "rb") as fileobj:
+            atoms = Atoms(fileobj)
+            offsets = []
+            for moof in self._moofs(atoms):
+                tfhd = list(moof.findall(b"tfhd", True))[0]
+                fileobj.seek(tfhd.offset + 9)
+                data = fileobj.read(tfhd.length - 9)
+                flags = cdata.uint_be(b"\x00" + data[:3])
+                self.failUnless(flags & 1,
+                                "fixture needs absolute base_data_offset")
+                offsets.append(cdata.ulonglong_be(data[7:15]))
+            return offsets
+
+    def _media_pointers(self, path):
+        """Resolved absolute media pointer of every fragment.
+
+        base_data_offset (tfhd) + data_offset (trun), which is where the
+        demuxer starts reading the fragment's samples.
+        """
+        pointers = []
+        with open(path, "rb") as fileobj:
+            atoms = Atoms(fileobj)
+            for moof in self._moofs(atoms):
+                tfhd = list(moof.findall(b"tfhd", True))[0]
+                trun = list(moof.findall(b"trun", True))[0]
+                fileobj.seek(tfhd.offset + 9)
+                tfhd_data = fileobj.read(tfhd.length - 9)
+                base = cdata.ulonglong_be(tfhd_data[7:15])
+                # trun: box header (8) + version/flags (4) + sample_count (4)
+                # then the signed data_offset field
+                fileobj.seek(trun.offset + 16)
+                data_offset = struct.unpack(">i", fileobj.read(4))[0]
+                pointers.append(base + data_offset)
+            return pointers, self._mdat_ranges(atoms)
+
+    def _tfra_offsets(self, path):
+        """Absolute moof offsets stored in the trailing mfra/tfra box."""
+        with open(path, "rb") as fileobj:
+            atoms = Atoms(fileobj)
+            if not any(a.name == b"mfra" for a in atoms.atoms):
+                return None
+            actual = [a.offset for a in self._moofs(atoms)]
+
+            fileobj.seek(0, 2)
+            file_size = fileobj.tell()
+            # The trailing mfro box's 4 byte payload is the total mfra size.
+            fileobj.seek(file_size - 4)
+            mfra_size = cdata.uint_be(fileobj.read(4))
+            mfra_offset = file_size - mfra_size
+            fileobj.seek(mfra_offset + 8)
+            end = mfra_offset + mfra_size
+
+            tfra = None
+            while fileobj.tell() + 8 <= end:
+                child = Atom(fileobj)
+                if child.name == b"tfra":
+                    tfra = child
+                fileobj.seek(child.offset + child.length)
+
+            ok, data = tfra.read(fileobj)
+            self.failUnless(ok)
+            version = data[0]
+            lengths = data[11]
+            count = cdata.uint_be(data[12:16])
+            time_size = 4 if version == 0 else 8
+            moof_size = time_size
+            entry_size = (
+                time_size + moof_size +
+                1 + ((lengths >> 4) & 3) +
+                1 + ((lengths >> 2) & 3) +
+                1 + (lengths & 3))
+
+            offsets = []
+            for i in range(count):
+                pos = 16 + i * entry_size
+                if moof_size == 4:
+                    offsets.append(
+                        cdata.uint_be(data[pos + time_size:pos + time_size + 4]))
+                else:
+                    offsets.append(cdata.ulonglong_be(
+                        data[pos + time_size:pos + time_size + 8]))
+            return offsets, actual
+
+    def _assert_pointers_valid(self, path):
+        pointers, mdat_ranges = self._media_pointers(path)
+        self.failUnless(len(pointers) >= 3)
+        for pointer in pointers:
+            self.failUnless(
+                any(start <= pointer < end for start, end in mdat_ranges),
+                "media pointer %d points outside every mdat" % pointer)
+
+    def _media_sample_bytes(self, path):
+        """The first bytes each fragment's pointer resolves to.
+
+        Tracking these across a resize proves every pointer still addresses
+        the same media sample, not merely that it lands inside some mdat.
+        """
+        pointers, _ = self._media_pointers(path)
+        samples = []
+        with open(path, "rb") as fileobj:
+            for pointer in pointers:
+                fileobj.seek(pointer)
+                samples.append(fileobj.read(8))
+        return samples
+
+    def test_fixture_has_multiple_fragments(self):
+        with open(self.filename, "rb") as fileobj:
+            atoms = Atoms(fileobj)
+            self.failUnless(len(self._moofs(atoms)) >= 3)
+
+    def test_update_all_base_data_offsets(self):
+        before = self._base_data_offsets(self.filename)
+        self.audio["\xa9nam"] = "x" * 400
+        self.audio.save()
+        after = self._base_data_offsets(self.filename)
+        self.failUnlessEqual(len(before), len(after))
+        delta = after[0] - before[0]
+        self.failUnless(delta > 0)
+        # Every fragment, not only the first one, must have been shifted.
+        self.failUnlessEqual(
+            after, [offset + delta for offset in before])
+        self._assert_pointers_valid(self.filename)
+
+    def test_media_pointers_survive_repeated_saves(self):
+        self._assert_pointers_valid(self.filename)
+        original_samples = self._media_sample_bytes(self.filename)
+        for round_no in range(3):
+            tags = MP4(self.filename)
+            tags["\xa9nam"] = "title %d" % round_no
+            tags["\xa9cmt"] = "z" * (100 * (round_no + 1))
+            tags.save()
+            self._assert_pointers_valid(self.filename)
+            # The references must keep addressing the identical samples;
+            # a stale pointer silently reads different (garbage) bytes.
+            self.failUnlessEqual(
+                self._media_sample_bytes(self.filename), original_samples)
+
+    def test_tfra_offsets_follow_moof_atoms(self):
+        result = self._tfra_offsets(self.filename)
+        self.failUnless(result is not None)
+        offsets, actual = result
+        self.failUnlessEqual(offsets, actual)
+        self.audio["\xa9nam"] = "x" * 400
+        self.audio.save()
+        offsets, actual = self._tfra_offsets(self.filename)
+        self.failUnlessEqual(offsets, actual)
+
+    def test_delete_tags_keeps_fragments_valid(self):
+        self.audio["\xa9nam"] = "x" * 400
+        self.audio.save()
+        MP4(self.filename).delete()
+        self._assert_pointers_valid(self.filename)
+        offsets, actual = self._tfra_offsets(self.filename)
+        self.failUnlessEqual(offsets, actual)
+
+
 class TMP4UpdateParents64Bit(TestCase):
     original = os.path.join(DATA_DIR, "64bit.mp4")
 
